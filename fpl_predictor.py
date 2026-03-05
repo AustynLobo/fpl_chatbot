@@ -24,6 +24,8 @@ Output:
 """
 
 import argparse
+import io
+import json
 import os
 import time
 import warnings
@@ -35,24 +37,124 @@ from sklearn.metrics import mean_absolute_error
 
 warnings.filterwarnings("ignore")
 os.makedirs("data", exist_ok=True)
+os.makedirs(os.path.join("data", "predictions"), exist_ok=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CLI
 # ─────────────────────────────────────────────────────────────────────────────
 parser = argparse.ArgumentParser()
-parser.add_argument("--predict-gw", type=int, default=None)
-parser.add_argument("--debug", default="", help="Player web_name for detailed trace")
+parser.add_argument("--predict-gw",    type=int, default=None)
+parser.add_argument("--debug",         default="", help="Player web_name for detailed trace")
+parser.add_argument("--force-refresh", action="store_true",
+                    help="Ignore cache and re-fetch all data from FPL API")
+parser.add_argument("--export",    action="store_true",
+                    help="Upload predictions + cache to S3 after running")
+parser.add_argument("--s3-bucket", default="",
+                    help="S3 bucket name for --export  e.g. my-fpl-bucket")
 args = parser.parse_args()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 1. Fetch bootstrap + fixtures
+# S3 upload helpers  (only used when --export is passed)
 # ─────────────────────────────────────────────────────────────────────────────
-print("Fetching bootstrap and fixtures from FPL API...")
-try:
-    bootstrap    = requests.get("https://fantasy.premierleague.com/api/bootstrap-static/", timeout=15).json()
-    fixtures_raw = requests.get("https://fantasy.premierleague.com/api/fixtures/",         timeout=15).json()
-except requests.exceptions.RequestException as e:
-    raise SystemExit(f"  ❌ API error: {e}")
+def s3_client():
+    try:
+        import boto3
+        return boto3.client("s3")
+    except ImportError:
+        raise SystemExit("❌ boto3 not installed. Run: pip install boto3")
+
+def upload_file_to_s3(local_path, s3_key, bucket):
+    s3 = s3_client()
+    s3.upload_file(local_path, bucket, s3_key)
+    print(f"  ☁️  s3://{bucket}/{s3_key}")
+
+def upload_df_to_s3(df, s3_key, bucket, fmt="csv"):
+    s3 = s3_client()
+    buf = io.BytesIO()
+    if fmt == "parquet":
+        df.to_parquet(buf, index=False)
+    else:
+        df.to_csv(buf, index=False)
+    buf.seek(0)
+    s3.put_object(Bucket=bucket, Key=s3_key, Body=buf.getvalue())
+    print(f"  ☁️  s3://{bucket}/{s3_key}")
+
+def upload_json_to_s3(obj, s3_key, bucket):
+    s3 = s3_client()
+    s3.put_object(
+        Bucket=bucket, Key=s3_key,
+        Body=json.dumps(obj).encode()
+    )
+    print(f"  ☁️  s3://{bucket}/{s3_key}")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Cache paths  (local — swap read/write calls for boto3 S3 calls on AWS)
+# ─────────────────────────────────────────────────────────────────────────────
+CACHE_DIR       = os.path.join("data", "cache")
+CACHE_META      = os.path.join(CACHE_DIR, "meta.json")           # last cached GW
+CACHE_BOOTSTRAP = os.path.join(CACHE_DIR, "bootstrap.json")
+CACHE_FIXTURES  = os.path.join(CACHE_DIR, "fixtures.json")
+CACHE_HISTORY   = os.path.join(CACHE_DIR, "player_history.parquet")
+os.makedirs(CACHE_DIR, exist_ok=True)
+
+
+def _live_last_gw():
+    bs = requests.get(
+        "https://fantasy.premierleague.com/api/bootstrap-static/", timeout=15
+    ).json()
+    finished = [e["id"] for e in bs.get("events", []) if e.get("finished")]
+    return max(finished) if finished else 0, bs
+
+
+def cache_valid():
+    if not all(os.path.exists(p) for p in
+               [CACHE_META, CACHE_BOOTSTRAP, CACHE_FIXTURES, CACHE_HISTORY]):
+        return False, None
+    try:
+        live_gw, live_bs = _live_last_gw()
+        with open(CACHE_META) as f:
+            cached_gw = json.load(f).get("last_finished_gw", -1)
+        if live_gw == cached_gw:
+            print(f"  Cache hit  — last finished GW = {live_gw}, no re-fetch needed")
+            return True, live_bs          # still return live_bs (tiny, already fetched)
+        print(f"  Cache miss — cached GW {cached_gw} -> live GW {live_gw}, re-fetching")
+        return False, live_bs
+    except Exception as ex:
+        print(f"  Cache check failed ({ex}), re-fetching")
+        return False, None
+
+
+def save_cache(bs, fx, hist_df, gw):
+    with open(CACHE_BOOTSTRAP, "w") as f:
+        json.dump(bs, f)
+    with open(CACHE_FIXTURES, "w") as f:
+        json.dump(fx, f)
+    hist_df.to_parquet(CACHE_HISTORY, index=False)
+    with open(CACHE_META, "w") as f:
+        json.dump({"last_finished_gw": int(gw)}, f)  # cast to int — numpy int32 is not JSON serializable
+    print(f"  Cache saved for GW {gw}")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. Load bootstrap + fixtures  (from cache or FPL API)
+# ─────────────────────────────────────────────────────────────────────────────
+print("Checking cache...")
+is_cached, prefetched_bs = (False, None) if args.force_refresh else cache_valid()
+
+if is_cached:
+    print("Loading bootstrap and fixtures from cache...")
+    with open(CACHE_BOOTSTRAP) as f:
+        bootstrap = json.load(f)
+    with open(CACHE_FIXTURES) as f:
+        fixtures_raw = json.load(f)
+else:
+    print("Fetching bootstrap and fixtures from FPL API...")
+    try:
+        bootstrap    = prefetched_bs or requests.get(
+            "https://fantasy.premierleague.com/api/bootstrap-static/", timeout=15).json()
+        fixtures_raw = requests.get(
+            "https://fantasy.premierleague.com/api/fixtures/", timeout=15).json()
+    except requests.exceptions.RequestException as e:
+        raise SystemExit(f"  ❌ API error: {e}")
 
 players  = pd.DataFrame(bootstrap["elements"])
 teams_df = pd.DataFrame(bootstrap["teams"])
@@ -82,34 +184,38 @@ print(f"  Val    (20%)    : " + (f"GW{val_gws[0]}–GW{val_gws[-1]}  ({len(val_g
 print(f"  Predicting      : GW{predict_gw}")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 3. Fetch exact per-GW history for every player via element-summary API
+# 3. Load exact per-GW history  (from cache or element-summary API)
 #
-#    This gives us: total_points, minutes, goals_scored, assists,
-#    clean_sheets, goals_conceded, own_goals, penalties_saved,
-#    penalties_missed, yellow_cards, red_cards, saves, bonus, bps
-#    — all EXACT values calculated by FPL, not reconstructed by us.
+#    element-summary gives us exact: total_points, minutes, goals_scored,
+#    assists, clean_sheets, bonus, saves etc. — calculated by FPL directly.
+#    On a cache hit this step takes <1 second instead of ~2 minutes.
 # ─────────────────────────────────────────────────────────────────────────────
-print(f"\nFetching per-GW history for {len(players)} players (this takes ~2 min)...")
-
-all_histories = []
 all_player_ids = players["id"].dropna().astype(int).tolist()
 
-for i, pid in enumerate(all_player_ids):
-    try:
-        url  = f"https://fantasy.premierleague.com/api/element-summary/{pid}/"
-        data = requests.get(url, timeout=10).json()
-        hist = pd.DataFrame(data.get("history", []))
-        if not hist.empty:
-            hist["player_id"] = pid
-            all_histories.append(hist)
-    except Exception:
-        pass
-    if (i + 1) % 100 == 0:
-        print(f"  {i+1}/{len(all_player_ids)} players fetched...")
-    time.sleep(0.05)   # polite rate limiting
+if is_cached:
+    history = pd.read_parquet(CACHE_HISTORY)
+    print(f"  Loaded {len(history)} player-GW records from cache")
+else:
+    print(f"\nFetching per-GW history for {len(players)} players (~2 min)...")
+    all_histories = []
 
-history = pd.concat(all_histories, ignore_index=True) if all_histories else pd.DataFrame()
-print(f"  ✅ Fetched {len(history)} player-GW records across {history['player_id'].nunique()} players")
+    for i, pid in enumerate(all_player_ids):
+        try:
+            url  = f"https://fantasy.premierleague.com/api/element-summary/{pid}/"
+            data = requests.get(url, timeout=10).json()
+            hist = pd.DataFrame(data.get("history", []))
+            if not hist.empty:
+                hist["player_id"] = pid
+                all_histories.append(hist)
+        except Exception:
+            pass
+        if (i + 1) % 100 == 0:
+            print(f"  {i+1}/{len(all_player_ids)} players fetched...")
+        time.sleep(0.05)
+
+    history = pd.concat(all_histories, ignore_index=True) if all_histories else pd.DataFrame()
+    print(f"  Fetched {len(history)} records across {history['player_id'].nunique()} players")
+    save_cache(bootstrap, fixtures_raw, history, last_finished_gw)
 
 # Standardise column names and types
 history["player_id"] = pd.to_numeric(history["player_id"], errors="coerce")
@@ -411,7 +517,7 @@ if val_frames:
     per_player_val["AvgPredPts"]   = per_player_val["AvgPredPts"].round(2)
     per_player_val["MAE"]          = per_player_val["MAE"].round(3)
 
-    val_summary_out = os.path.join("data", f"fpl_validation_summary_gw{predict_gw}.csv")
+    val_summary_out = os.path.join("data", "predictions", f"fpl_validation_summary_gw{predict_gw}.csv")
     per_player_val[["Player","Pos","GWsEval","AvgActualPts","AvgPredPts","MAE"]].to_csv(
         val_summary_out, index=False
     )
@@ -607,17 +713,17 @@ for pos_label, top in zip(["GK","DEF","MID","FWD"], best_by_pos):
                "AvgMin(L5)","AvailScore","RawPts","PredPts","Value"]].to_string(index=False))
 
 # Save all predictions
-pred_out = os.path.join("data", f"fpl_predictions_gw{predict_gw}.csv")
+pred_out = os.path.join("data", "predictions", f"fpl_predictions_gw{predict_gw}.csv")
 results.to_csv(pred_out, index=False)
 
 # Save best by position
-best_out  = os.path.join("data", f"fpl_best_by_position_gw{predict_gw}.csv")
+best_out  = os.path.join("data", "predictions", f"fpl_best_by_position_gw{predict_gw}.csv")
 pd.concat(best_by_pos).to_csv(best_out, index=False)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 17. Training summary
 # ─────────────────────────────────────────────────────────────────────────────
-summary_path = os.path.join("data", "fpl_training_summary.txt")
+summary_path = os.path.join("data", "predictions", "fpl_training_summary.txt")
 with open(summary_path, "w") as f:
     f.write("FPL Model Training Summary\n==========================\n\n")
     f.write(f"Predicting GW     : {predict_gw}\n")
@@ -641,5 +747,52 @@ print(f"✅  Best by position → {best_out}")
 if val_summary_out:
     print(f"✅  Validation       → {val_summary_out}")
 print(f"✅  Summary          → {summary_path}")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Export to S3  (only runs when --export --s3-bucket <name> is passed)
+#
+# What gets uploaded:
+#   predictions/fpl_predictions_gw<N>.csv        ← chatbot reads this
+#   predictions/fpl_best_by_position_gw<N>.csv   ← chatbot reads this
+#   predictions/fpl_training_summary.txt
+#   cache/bootstrap.json                          ← cache for next run
+#   cache/fixtures.json
+#   cache/player_history.parquet
+#   cache/meta.json
+#
+# Lambda / chatbot only ever reads from predictions/ — it never touches
+# the model code or the cache/ prefix.
+# ─────────────────────────────────────────────────────────────────────────────
+if args.export:
+    if not args.s3_bucket:
+        print("\n⚠️  --export requires --s3-bucket <bucket-name>")
+    else:
+        bucket = args.s3_bucket
+        gw_tag = f"gw{predict_gw}"
+        print(f"\nUploading to s3://{bucket} ...")
+
+        # Prediction outputs — Lambda reads these
+        upload_file_to_s3(pred_out,     f"predictions/fpl_predictions_{gw_tag}.csv",       bucket)
+        upload_file_to_s3(best_out,     f"predictions/fpl_best_by_position_{gw_tag}.csv",  bucket)
+        upload_file_to_s3(summary_path, f"predictions/fpl_training_summary.txt",           bucket)
+        if val_summary_out:
+            upload_file_to_s3(val_summary_out,
+                              f"predictions/fpl_validation_{gw_tag}.csv", bucket)
+
+        # Cache files — next local run can pull these down instead of re-fetching
+        with open(CACHE_BOOTSTRAP) as f:
+            bs_obj = json.load(f)
+        with open(CACHE_FIXTURES) as f:
+            fx_obj = json.load(f)
+        upload_json_to_s3(bs_obj,  "cache/bootstrap.json",           bucket)
+        upload_json_to_s3(fx_obj,  "cache/fixtures.json",            bucket)
+        upload_df_to_s3(history,   "cache/player_history.parquet",   bucket, fmt="parquet")
+        upload_json_to_s3({"last_finished_gw": last_finished_gw},
+                          "cache/meta.json", bucket)
+
+        print(f"\n✅  All files uploaded to s3://{bucket}")
+        print(f"   Lambda chatbot reads: predictions/fpl_best_by_position_{gw_tag}.csv")
+
 print(f"\nRun again next GW — API data updates automatically each week.")
-print(f"To trace a player:  python fpl_predictor.py --debug \"Salah\"")
+print(f"To trace a player : python fpl_predictor.py --debug \"Salah\"")
+print(f"To upload to S3   : python fpl_predictor.py --export --s3-bucket your-bucket-name")
