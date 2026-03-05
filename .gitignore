@@ -1,4 +1,7 @@
 venv/
-__pycache__/
+data/cache/
+data/predictions/
+*.parquet
 *.pyc
+__pycache__/
 .env
