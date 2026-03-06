@@ -787,7 +787,7 @@ if args.export:
         upload_json_to_s3(bs_obj,  "cache/bootstrap.json",           bucket)
         upload_json_to_s3(fx_obj,  "cache/fixtures.json",            bucket)
         upload_df_to_s3(history,   "cache/player_history.parquet",   bucket, fmt="parquet")
-        upload_json_to_s3({"last_finished_gw": last_finished_gw},
+        upload_json_to_s3({"last_finished_gw": int(last_finished_gw)},
                           "cache/meta.json", bucket)
 
         print(f"\n✅  All files uploaded to s3://{bucket}")
