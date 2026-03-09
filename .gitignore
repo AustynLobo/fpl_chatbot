@@ -1,7 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
 venv/
+.venv/
+env/
+
+# Environment variables — NEVER commit these
+.env
+*.env
+
+# AWS credentials — NEVER commit these
+.aws/
+credentials
+
+# Data and cache — too large for git, rebuilt automatically
 data/cache/
 data/predictions/
-*.parquet
-*.pyc
-__pycache__/
-.env
+logs/
+
+# VS Code
+.vscode/
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# Mac
+.DS_Store
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
