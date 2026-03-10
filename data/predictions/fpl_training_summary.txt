@@ -13,8 +13,8 @@ Train rows        : 8,376 (77.9%)
 Val rows          : 2,380 (22.1%)
 
 Per-position MAE on validation GWs:
-  GK  : 2.375 pts
-  DEF : 2.114 pts
-  MID : 1.836 pts
-  FWD : 2.237 pts
-  Overall avg: 2.141 pts
+  GK  : 2.386 pts
+  DEF : 1.996 pts
+  MID : 1.745 pts
+  FWD : 2.228 pts
+  Overall avg: 2.089 pts

@@ -329,17 +329,34 @@ ROLL_STATS = [c for c in ROLL_STATS if c in grid.columns]
 
 for stat in ROLL_STATS:
     grp = grid.groupby("player_id")[stat]
-    grid[f"{stat}_mean5"] = grp.transform(lambda x: x.shift(1).rolling(5, min_periods=1).mean())
-    grid[f"{stat}_sum5"]  = grp.transform(lambda x: x.shift(1).rolling(5, min_periods=1).sum())
-    grid[f"{stat}_std5"]  = grp.transform(lambda x: x.shift(1).rolling(5, min_periods=1).std().fillna(0))
 
-# Form trend: recent 5-GW avg vs earlier 10-GW avg (positive = improving)
-grid["pts_trend"] = (
-    grid["total_points_mean5"] -
-    grid.groupby("player_id")["total_points"].transform(
-        lambda x: x.shift(1).rolling(10, min_periods=1).mean()
-    )
-)
+    # existing features — kept
+    grid[f"{stat}_mean5"] = grp.transform(lambda x: x.shift(1).rolling(5,  min_periods=1).mean())
+    grid[f"{stat}_sum5"]  = grp.transform(lambda x: x.shift(1).rolling(5,  min_periods=1).sum())
+    grid[f"{stat}_std5"]  = grp.transform(lambda x: x.shift(1).rolling(5,  min_periods=1).std().fillna(0))
+
+    # Option 2 — EWA: all history, recent games weighted more heavily
+    grid[f"{stat}_ewm"]   = grp.transform(lambda x: x.shift(1).ewm(span=5, min_periods=1).mean())
+
+    # Option 3 — long term baseline (19 GWs ≈ half a season)
+    grid[f"{stat}_mean19"] = grp.transform(lambda x: x.shift(1).rolling(19, min_periods=1).mean())
+
+    # Option 3 — trend: positive = improving, negative = declining
+    grid[f"{stat}_trend"]  = grid[f"{stat}_mean5"] - grid[f"{stat}_mean19"]
+
+# Overall points trend (kept for backwards compatibility)
+grid["pts_trend"] = grid["total_points_mean5"] - grid["total_points_mean19"]
+
+# xG per GW — last GW's raw xG as a direct feature (shift already applied in grid)
+# These columns already exist in grid from the element-summary API
+# We expose the previous GW's value directly so XGBoost sees
+# "how many expected goals did this player generate last week"
+for xg_col in ["expected_goals", "expected_assists", "expected_goal_involvements",
+                "expected_goals_conceded"]:
+    if xg_col in grid.columns:
+        grid[f"{xg_col}_last"] = grid.groupby("player_id")[xg_col].transform(
+            lambda x: x.shift(1)
+        )
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 7. Merge player metadata + position-specific features
@@ -373,9 +390,16 @@ grid["saves_form"]     = grid["saves_mean5"] * (grid["element_type"] == 1).astyp
 #    Each position model also gets its own specialist features.
 # ─────────────────────────────────────────────────────────────────────────────
 COMMON_ROLL = (
-    [f"{s}_mean5" for s in ROLL_STATS] +
-    [f"{s}_sum5"  for s in ROLL_STATS] +
-    [f"{s}_std5"  for s in ROLL_STATS]
+    [f"{s}_mean5"  for s in ROLL_STATS] +
+    [f"{s}_sum5"   for s in ROLL_STATS] +
+    [f"{s}_std5"   for s in ROLL_STATS] +
+    [f"{s}_ewm"    for s in ROLL_STATS] +   # Option 2 — EWA
+    [f"{s}_mean19" for s in ROLL_STATS] +   # Option 3 — long term baseline
+    [f"{s}_trend"  for s in ROLL_STATS] +   # Option 3 — trend direction
+    [f"{c}_last" for c in [                 # xG last GW direct features
+        "expected_goals", "expected_assists",
+        "expected_goal_involvements", "expected_goals_conceded"
+    ]]
 )
 COMMON_META = [
     "fdr", "is_home", "now_cost", "pts_x_fdr", "home_x_form", "pts_trend"
@@ -383,10 +407,38 @@ COMMON_META = [
 
 # Position-specific extra features
 POS_EXTRA = {
-    1: ["cs_form", "saves_form", "clean_sheets_per_90", "saves_per_90"],          # GK
-    2: ["cs_form", "clean_sheets_per_90", "goals_conceded_per_90"],                # DEF
-    3: ["gi_form", "expected_goals_per_90", "expected_assists_per_90"],            # MID
-    4: ["gi_form", "expected_goals_per_90", "expected_assists_per_90"],            # FWD
+    1: [                                            # GK
+        "cs_form", "saves_form",
+        "clean_sheets_per_90", "saves_per_90",
+        "expected_goals_conceded_last",             # last GW xGC
+        "expected_goals_conceded_ewm",              # season xGC trend
+    ],
+    2: [                                            # DEF
+        "cs_form",
+        "clean_sheets_per_90", "goals_conceded_per_90",
+        "expected_goals_conceded_last",             # last GW xGC
+        "expected_goals_conceded_ewm",
+        "expected_goals_last",                      # DEF goals are rare but valuable
+        "expected_assists_last",
+    ],
+    3: [                                            # MID
+        "gi_form",
+        "expected_goals_per_90", "expected_assists_per_90",
+        "expected_goals_last",                      # last GW raw xG
+        "expected_assists_last",                    # last GW raw xA
+        "expected_goal_involvements_last",          # last GW xGI
+        "expected_goals_ewm",                       # season xG trend
+        "expected_goal_involvements_ewm",
+    ],
+    4: [                                            # FWD
+        "gi_form",
+        "expected_goals_per_90", "expected_assists_per_90",
+        "expected_goals_last",                      # last GW raw xG
+        "expected_assists_last",
+        "expected_goal_involvements_last",
+        "expected_goals_ewm",
+        "expected_goal_involvements_ewm",
+    ],
 }
 
 BASE_FEATURES = COMMON_ROLL + COMMON_META
@@ -438,7 +490,7 @@ for pos, pos_label in POS_LABELS.items():
     overall_val_rows   += len(val_p)
 
     m = XGBRegressor(
-        n_estimators=600, learning_rate=0.04, max_depth=4,
+        n_estimators=600, learning_rate=0.04, max_depth=3,
         subsample=0.8, colsample_bytree=0.8, min_child_weight=5,
         objective="reg:squarederror", random_state=42, verbosity=0
     )
@@ -542,10 +594,17 @@ gw_teams = gw_teams.sort_values("fdr").drop_duplicates("team")
 # 12. Rolling state at last_finished_gw (the feature snapshot for prediction)
 # ─────────────────────────────────────────────────────────────────────────────
 roll_cols = (
-    [f"{s}_mean5" for s in ROLL_STATS] +
-    [f"{s}_sum5"  for s in ROLL_STATS] +
-    [f"{s}_std5"  for s in ROLL_STATS] +
-    ["pts_trend","cs_form","gi_form","saves_form"]
+    [f"{s}_mean5"  for s in ROLL_STATS] +
+    [f"{s}_sum5"   for s in ROLL_STATS] +
+    [f"{s}_std5"   for s in ROLL_STATS] +
+    [f"{s}_ewm"    for s in ROLL_STATS] +
+    [f"{s}_mean19" for s in ROLL_STATS] +
+    [f"{s}_trend"  for s in ROLL_STATS] +
+    [f"{c}_last" for c in [
+        "expected_goals", "expected_assists",
+        "expected_goal_involvements", "expected_goals_conceded"
+    ]] +
+    ["pts_trend", "cs_form", "gi_form", "saves_form"]
 )
 roll_cols = [c for c in roll_cols if c in grid.columns]
 
