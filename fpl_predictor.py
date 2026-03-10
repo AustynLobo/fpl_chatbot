@@ -490,7 +490,7 @@ for pos, pos_label in POS_LABELS.items():
     overall_val_rows   += len(val_p)
 
     m = XGBRegressor(
-        n_estimators=600, learning_rate=0.04, max_depth=3,
+        n_estimators=800, learning_rate=0.03, max_depth=3,
         subsample=0.8, colsample_bytree=0.8, min_child_weight=5,
         objective="reg:squarederror", random_state=42, verbosity=0
     )
