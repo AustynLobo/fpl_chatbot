@@ -5,8 +5,14 @@ import io
 import urllib.request
 import urllib.parse
 import os
+import boto3
 
-S3_BUCKET = "my-fpl-predictions"
+dynamodb = boto3.resource("dynamodb")
+table    = dynamodb.Table(os.environ["DYNAMODB_TABLE"])
+
+MAX_HISTORY = 10  # keep last 10 messages per user
+
+S3_BUCKET = os.environ["S3_BUCKET"]
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
@@ -18,6 +24,25 @@ FPL_KEYWORDS = [
     "best", "value", "cheap", "recommend", "who", "should", "vice captain", 
     "triple captain", "team"
 ]
+
+def get_history(chat_id):
+    try:
+        response = table.get_item(Key={"chat_id": str(chat_id)})
+        return response.get("Item", {}).get("messages", [])
+    except Exception:
+        return []
+
+
+def save_history(chat_id, messages):
+    try:
+        # keep only last MAX_HISTORY messages to avoid token limits
+        messages = messages[-MAX_HISTORY:]
+        table.put_item(Item={
+            "chat_id"  : str(chat_id),
+            "messages" : messages
+        })
+    except Exception:
+        pass
 
 def is_fpl_related(message):
     message_lower = message.lower()
@@ -56,7 +81,15 @@ def get_latest_predictions():
     return f"GW{gw} Predictions:\n" + "\n".join(lines)
 
 
-def ask_claude(user_message, predictions_context):
+def ask_claude(user_message, predictions_context, history):
+    # build message list from history + current message
+    messages = history + [
+        {
+            "role": "user",
+            "content": f"FPL data:\n{predictions_context}\n\nQuestion: {user_message}"
+        }
+    ]
+
     payload = json.dumps({
         "model": "claude-haiku-4-5-20251001",
         "max_tokens": 1024,
@@ -67,12 +100,7 @@ def ask_claude(user_message, predictions_context):
             "and predicted points when recommending players. "
             "Keep responses under 200 words as this is a Telegram chat."
         ),
-        "messages": [
-            {
-                "role": "user",
-                "content": f"FPL data:\n{predictions_context}\n\nQuestion: {user_message}"
-            }
-        ]
+        "messages": messages
     }).encode()
 
     req = urllib.request.Request(
@@ -80,7 +108,7 @@ def ask_claude(user_message, predictions_context):
         data=payload,
         headers={
             "Content-Type": "application/json",
-            "x-api-key": ANTHROPIC_API_KEY,
+            "x-api-key": os.environ["ANTHROPIC_API_KEY"],
             "anthropic-version": "2023-06-01"
         }
     )
@@ -123,31 +151,26 @@ def send_typing_action(chat_id):
 
 def lambda_handler(event, context):
     try:
-        body = json.loads(event.get("body", "{}"))
-        
-        # extract message from Telegram update
-        message = body.get("message", {})
-        chat_id = message.get("chat", {}).get("id")
+        body         = json.loads(event.get("body", "{}"))
+        message      = body.get("message", {})
+        chat_id      = message.get("chat", {}).get("id")
         user_message = message.get("text", "")
 
-        # ignore non-message updates (joins, leaves etc)
         if not chat_id or not user_message:
             return {"statusCode": 200, "body": "ok"}
 
-        # handle /start command
         if user_message == "/start":
+            # clear history on /start so conversation resets
+            save_history(chat_id, [])
             send_telegram_message(
                 chat_id,
                 "👋 Welcome to the *FPL Predictor Bot*!\n\n"
-                "Ask me anything about this gameweek, for example:\n"
+                "Ask me anything about this gameweek:\n"
                 "• Who are the best value midfielders?\n"
-                "• Which defenders have the easiest fixtures?\n"
+                "• Which defenders have easy fixtures?\n"
                 "• Who should I captain this week?"
             )
             return {"statusCode": 200, "body": "ok"}
-
-        # show typing indicator while processing
-        send_typing_action(chat_id)
 
         if not is_fpl_related(user_message):
             send_telegram_message(
@@ -159,20 +182,35 @@ def lambda_handler(event, context):
             )
             return {"statusCode": 200, "body": "ok"}
 
-        # get predictions and ask Claude
-        predictions = get_latest_predictions()
-        answer = ask_claude(user_message, predictions)
+        send_typing_action(chat_id)
 
-        # send reply back to user
+        # load conversation history
+        history = get_history(chat_id)
+
+        # get predictions and ask Claude with full history
+        predictions = get_latest_predictions()
+        answer      = ask_claude(user_message, predictions, history)
+
+        # update history with this exchange
+        history.append({"role": "user",      "content": user_message})
+        history.append({"role": "assistant", "content": answer})
+        save_history(chat_id, history)
+
         send_telegram_message(chat_id, answer)
 
         return {"statusCode": 200, "body": "ok"}
 
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode()
+        return {
+            "statusCode": 500,
+            "body": json.dumps({
+                "error"  : f"HTTP {e.code}",
+                "detail" : error_body
+            })
+        }
     except Exception as e:
-        print(f"Error: {str(e)}")
-        if chat_id:
-            send_telegram_message(
-                chat_id,
-                "Sorry, something went wrong. Please try again."
-            )
-        return {"statusCode": 200, "body": "ok"}
+        return {
+            "statusCode": 500,
+            "body": json.dumps({"error": str(e)})
+        }
